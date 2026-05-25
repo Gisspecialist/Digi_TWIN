@@ -1,0 +1,23 @@
+Vector Targeting Fix Notes
+==========================
+
+Corrected issue:
+- The production frontend previously defaulted to New York coordinates.
+- The Vector Targeting section has now been corrected to use Belize's approximate geographic center as the default example.
+
+Correct coordinate convention:
+- Latitude / North-South: North is positive, South is negative.
+- Longitude / East-West: East is positive, West is negative.
+
+Belize default:
+- Decimal degrees: 17.25, -88.7667
+- Degrees/minutes: 17° 15' N, 88° 45' W
+
+Frontend changes:
+- Default latitude set to 17.25.
+- Default longitude set to -88.7667.
+- Input precision increased to step=0.0001.
+- Coordinate guidance box added to the Vector Targeting panel.
+- Belize Center preset button added.
+- New York preset retained for comparison/testing.
+- Initial backend data-fusion call now starts at Belize coordinates.

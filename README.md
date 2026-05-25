@@ -57,3 +57,13 @@ pytest
 ## Production Notes
 
 This is now a production-ready scaffold, not just a standalone demo. For a mission-critical fully operational planetary digital twin, connect the visual layers to validated gridded geospatial datasets, add persistent storage, auth, observability, data lineage, model governance, and scheduled ingestion.
+
+## Vector Targeting Correction — Belize Default
+
+The frontend Vector Targeting panel has been corrected to use standard decimal-degree coordinate conventions:
+
+- Latitude: North is positive, South is negative.
+- Longitude: East is positive, West is negative.
+- Belize approximate geographic center: latitude `17.25`, longitude `-88.7667`.
+
+The application now starts with Belize as the default vector target and includes quick presets for Belize Center and New York City.
