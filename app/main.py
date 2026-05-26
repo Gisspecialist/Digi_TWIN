@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import math
+import os
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Query
@@ -12,292 +12,219 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-STATIC_DIR = BASE_DIR / "static"
-CACHE_TTL_SECONDS = 300
-_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "12"))
+CORS_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").split(",") if origin.strip()]
 
 app = FastAPI(
     title="3D Planetary Digital Twin Simulation Interface",
-    description="Operational-style planetary environmental digital twin scaffold with safer live data endpoints.",
-    version="1.1.0-amended-open-meteo-fallbacks",
+    version="1.0.0",
+    description="Operational-style planetary environmental digital twin API and WebGL interface.",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
+    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
+    allow_credentials=True,
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+_cache: dict[str, tuple[float, Any]] = {}
 
 
-def clamp(value: float, min_value: float, max_value: float) -> float:
-    return max(min_value, min(max_value, value))
+@dataclass
+class NearestFeature:
+    title: str
+    distance_km: float
+    latitude: float
+    longitude: float
+    source: str
 
 
-def clean_coord(lat: float, lng: float) -> Tuple[float, float]:
-    return clamp(float(lat), -90, 90), clamp(float(lng), -180, 180)
+def cache_get(key: str) -> Any | None:
+    item = _cache.get(key)
+    if not item:
+        return None
+    saved_at, value = item
+    if time.time() - saved_at > CACHE_TTL_SECONDS:
+        _cache.pop(key, None)
+        return None
+    return value
 
 
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius = 6371.0088
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * radius * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+def cache_set(key: str, value: Any) -> Any:
+    _cache[key] = (time.time(), value)
+    return value
 
 
-def cache_key(lat: float, lng: float) -> str:
-    return f"{lat:.4f},{lng:.4f}"
+def clamp_coordinate(lat: float, lng: float) -> tuple[float, float]:
+    lat = max(-90.0, min(90.0, float(lat)))
+    lng = max(-180.0, min(180.0, float(lng)))
+    return lat, lng
 
 
-async def fetch_json(client: httpx.AsyncClient, url: str, params: Optional[dict] = None) -> Tuple[Optional[dict], str, Optional[str]]:
+def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_km = 6371.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    return radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def classify_risk(pm25: float | None, wind_kmh: float | None, precipitation_mm: float | None, event_km: float | None, quake_km: float | None) -> dict[str, str]:
+    pm25_value = pm25 if isinstance(pm25, (int, float)) and math.isfinite(pm25) else None
+    wind_value = wind_kmh if isinstance(wind_kmh, (int, float)) and math.isfinite(wind_kmh) else 0
+    precip_value = precipitation_mm if isinstance(precipitation_mm, (int, float)) and math.isfinite(precipitation_mm) else 0
+    event_value = event_km if isinstance(event_km, (int, float)) and math.isfinite(event_km) else None
+    quake_value = quake_km if isinstance(quake_km, (int, float)) and math.isfinite(quake_km) else None
+
+    if pm25_value is None and event_value is None and quake_value is None:
+        return {"level": "limited", "message": "Risk cannot be fully classified because live air quality and nearby hazard signals were unavailable."}
+
+    if (pm25_value is not None and pm25_value >= 35) or (quake_value is not None and quake_value <= 150):
+        return {"level": "high", "message": "High concern: PM2.5 or nearby seismic activity indicates an elevated environmental stress signal."}
+
+    if (pm25_value is not None and pm25_value >= 12) or wind_value > 35 or precip_value > 2 or (event_value is not None and event_value <= 500) or (quake_value is not None and quake_value <= 500):
+        return {"level": "moderate", "message": "Moderate watch: one or more air quality, weather, NASA event, or earthquake indicators crossed the watch threshold."}
+
+    return {"level": "low", "message": "Lower immediate stress signal detected from the currently available live feeds."}
+
+
+async def fetch_json(client: httpx.AsyncClient, url: str) -> tuple[bool, dict[str, Any] | None, str | None]:
     try:
-        response = await client.get(url, params=params, timeout=15)
+        response = await client.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
-        return response.json(), "online", None
-    except Exception as exc:  # noqa: BLE001 - returned in diagnostic payload
-        return None, "offline", str(exc)
+        return True, response.json(), None
+    except Exception as exc:  # noqa: BLE001 - deliberate API health capture
+        return False, None, str(exc)
 
 
-async def fetch_weather(client: httpx.AsyncClient, lat: float, lng: float) -> Dict[str, Any]:
-    """Fetch weather using a robust primary endpoint and a richer fallback.
+def nearest_from_geojson(lat: float, lng: float, features: list[dict[str, Any]], source: str) -> NearestFeature | None:
+    nearest: NearestFeature | None = None
+    for feature in features:
+        geometry = feature.get("geometry") or {}
+        properties = feature.get("properties") or {}
+        coords: list[Any] | None = None
+        geometry_type = geometry.get("type")
 
-    Primary endpoint intentionally uses current_weather=true because it is stable in
-    browsers, Vercel/serverless fetches, and simple backend adapters. The richer
-    current= endpoint is retained as fallback when current_weather is unavailable.
-    """
-    primary_params = {
-        "latitude": lat,
-        "longitude": lng,
-        "current_weather": "true",
-        "timezone": "America/Belize",
-    }
-    primary_url = "https://api.open-meteo.com/v1/forecast"
-    data, status, error = await fetch_json(client, primary_url, primary_params)
-    if data and data.get("current_weather"):
-        current = data["current_weather"]
-        return {
-            "status": "online",
-            "source_url": str(httpx.URL(primary_url, params=primary_params)),
-            "temperature_c": current.get("temperature"),
-            "wind_speed_kmh": current.get("windspeed"),
-            "wind_direction_deg": current.get("winddirection"),
-            "weather_code": current.get("weathercode"),
-            "time": current.get("time"),
-            "precipitation_mm": None,
-            "relative_humidity_pct": None,
-            "fallback_used": False,
-        }
+        if geometry_type == "Point":
+            coords = geometry.get("coordinates")
+        elif geometry_type == "Polygon":
+            coords = (((geometry.get("coordinates") or [[]])[0]) or [[None, None]])[0]
+        elif geometry_type == "MultiPolygon":
+            coords = (((geometry.get("coordinates") or [[[[]]]])[0][0]) or [[None, None]])[0]
 
-    fallback_params = {
-        "latitude": lat,
-        "longitude": lng,
-        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m",
-        "timezone": "America/Belize",
-    }
-    data2, status2, error2 = await fetch_json(client, primary_url, fallback_params)
-    if data2 and data2.get("current"):
-        current = data2["current"]
-        return {
-            "status": "online",
-            "source_url": str(httpx.URL(primary_url, params=fallback_params)),
-            "temperature_c": current.get("temperature_2m"),
-            "wind_speed_kmh": current.get("wind_speed_10m"),
-            "wind_direction_deg": current.get("wind_direction_10m"),
-            "weather_code": current.get("weather_code"),
-            "time": current.get("time"),
-            "precipitation_mm": current.get("precipitation"),
-            "relative_humidity_pct": current.get("relative_humidity_2m"),
-            "fallback_used": True,
-        }
+        if not coords or len(coords) < 2:
+            continue
+        try:
+            feature_lng = float(coords[0])
+            feature_lat = float(coords[1])
+        except (TypeError, ValueError):
+            continue
 
-    return {
-        "status": "offline",
-        "source_url": str(httpx.URL(primary_url, params=primary_params)),
-        "error": error2 or error or "No current weather payload returned.",
-        "temperature_c": None,
-        "wind_speed_kmh": None,
-        "precipitation_mm": None,
-        "relative_humidity_pct": None,
-        "fallback_used": True,
-    }
-
-
-async def fetch_air_quality(client: httpx.AsyncClient, lat: float, lng: float) -> Dict[str, Any]:
-    base_url = "https://air-quality-api.open-meteo.com/v1/air-quality"
-    params = {
-        "latitude": lat,
-        "longitude": lng,
-        "current": "pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,ozone,us_aqi,european_aqi",
-        "timezone": "America/Belize",
-    }
-    data, status, error = await fetch_json(client, base_url, params)
-    if data and data.get("current"):
-        current = data["current"]
-        return {
-            "status": "online",
-            "source_url": str(httpx.URL(base_url, params=params)),
-            "pm2_5": current.get("pm2_5"),
-            "pm10": current.get("pm10"),
-            "us_aqi": current.get("us_aqi"),
-            "european_aqi": current.get("european_aqi"),
-            "carbon_monoxide": current.get("carbon_monoxide"),
-            "nitrogen_dioxide": current.get("nitrogen_dioxide"),
-            "ozone": current.get("ozone"),
-            "time": current.get("time"),
-            "fallback_used": False,
-        }
-
-    fallback_params = {
-        "latitude": lat,
-        "longitude": lng,
-        "hourly": "pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,ozone,us_aqi,european_aqi",
-        "forecast_hours": 24,
-        "timezone": "America/Belize",
-    }
-    data2, status2, error2 = await fetch_json(client, base_url, fallback_params)
-    hourly = data2.get("hourly", {}) if data2 else {}
-    if hourly and hourly.get("time"):
-        idx = 0
-        return {
-            "status": "online",
-            "source_url": str(httpx.URL(base_url, params=fallback_params)),
-            "pm2_5": (hourly.get("pm2_5") or [None])[idx],
-            "pm10": (hourly.get("pm10") or [None])[idx],
-            "us_aqi": (hourly.get("us_aqi") or [None])[idx],
-            "european_aqi": (hourly.get("european_aqi") or [None])[idx],
-            "carbon_monoxide": (hourly.get("carbon_monoxide") or [None])[idx],
-            "nitrogen_dioxide": (hourly.get("nitrogen_dioxide") or [None])[idx],
-            "ozone": (hourly.get("ozone") or [None])[idx],
-            "time": hourly.get("time", [None])[idx],
-            "fallback_used": True,
-        }
-    return {"status": "offline", "source_url": str(httpx.URL(base_url, params=params)), "error": error2 or error}
-
-
-async def fetch_eonet(client: httpx.AsyncClient, lat: float, lng: float) -> Dict[str, Any]:
-    # Bounding box around the selected point. EONET bbox order: west,south,east,north.
-    pad = 5.0
-    bbox = f"{lng-pad},{lat-pad},{lng+pad},{lat+pad}"
-    url = "https://eonet.gsfc.nasa.gov/api/v3/events/geojson"
-    params = {"bbox": bbox, "status": "open", "limit": 20}
-    data, status, error = await fetch_json(client, url, params)
-    nearest = None
-    if data and data.get("features"):
-        for feature in data["features"]:
-            geom = feature.get("geometry") or {}
-            coords = geom.get("coordinates")
-            if isinstance(coords, list):
-                point = coords
-                while isinstance(point, list) and point and isinstance(point[0], list):
-                    point = point[0]
-                if isinstance(point, list) and len(point) >= 2:
-                    dist = haversine_km(lat, lng, float(point[1]), float(point[0]))
-                    item = {
-                        "title": (feature.get("properties") or {}).get("title"),
-                        "distance_km": round(dist, 1),
-                        "geometry_type": geom.get("type"),
-                    }
-                    nearest = item if nearest is None or item["distance_km"] < nearest["distance_km"] else nearest
-    return {"status": status, "source_url": str(httpx.URL(url, params=params)), "nearest_event": nearest, "error": error}
-
-
-async def fetch_quakes(client: httpx.AsyncClient, lat: float, lng: float) -> Dict[str, Any]:
-    url = "https://earthquake.usgs.gov/fdsnws/event/1/query"
-    params = {"format": "geojson", "latitude": lat, "longitude": lng, "maxradiuskm": 1000, "orderby": "time", "limit": 10}
-    data, status, error = await fetch_json(client, url, params)
-    nearest = None
-    if data and data.get("features"):
-        for feature in data["features"]:
-            coords = (feature.get("geometry") or {}).get("coordinates") or []
-            if len(coords) >= 2:
-                dist = haversine_km(lat, lng, float(coords[1]), float(coords[0]))
-                props = feature.get("properties") or {}
-                item = {"place": props.get("place"), "magnitude": props.get("mag"), "distance_km": round(dist, 1)}
-                nearest = item if nearest is None or item["distance_km"] < nearest["distance_km"] else nearest
-    return {"status": status, "source_url": str(httpx.URL(url, params=params)), "nearest_quake": nearest, "error": error}
-
-
-def classify_risk(weather: Dict[str, Any], air: Dict[str, Any], eonet: Dict[str, Any], quakes: Dict[str, Any]) -> Dict[str, Any]:
-    pm25 = air.get("pm2_5")
-    wind = weather.get("wind_speed_kmh")
-    precip = weather.get("precipitation_mm")
-    event_distance = (eonet.get("nearest_event") or {}).get("distance_km")
-    quake_distance = (quakes.get("nearest_quake") or {}).get("distance_km")
-    triggers = []
-    level = "low"
-
-    if isinstance(pm25, (int, float)) and pm25 >= 35:
-        level = "high"; triggers.append("PM2.5 >= 35 ug/m3")
-    if isinstance(quake_distance, (int, float)) and quake_distance <= 150:
-        level = "high"; triggers.append("earthquake within 150 km")
-    if level != "high":
-        if isinstance(pm25, (int, float)) and pm25 >= 12:
-            level = "moderate"; triggers.append("PM2.5 >= 12 ug/m3")
-        if isinstance(wind, (int, float)) and wind > 35:
-            level = "moderate"; triggers.append("wind speed > 35 km/h")
-        if isinstance(precip, (int, float)) and precip > 2:
-            level = "moderate"; triggers.append("precipitation > 2 mm")
-        if isinstance(event_distance, (int, float)) and event_distance <= 500:
-            level = "moderate"; triggers.append("NASA EONET event within 500 km")
-        if isinstance(quake_distance, (int, float)) and quake_distance <= 500:
-            level = "moderate"; triggers.append("earthquake within 500 km")
-
-    if pm25 is None and event_distance is None and quake_distance is None:
-        level = "limited"
-        triggers.append("insufficient live hazard information")
-
-    return {"level": level, "triggers": triggers or ["No immediate threshold crossed from available feeds."]}
+        distance = haversine_distance_km(lat, lng, feature_lat, feature_lng)
+        if nearest is None or distance < nearest.distance_km:
+            nearest = NearestFeature(
+                title=str(feature.get("title") or properties.get("title") or properties.get("place") or "Unnamed event"),
+                distance_km=distance,
+                latitude=feature_lat,
+                longitude=feature_lng,
+                source=source,
+            )
+    return nearest
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+async def index() -> FileResponse:
+    return FileResponse("static/index.html")
 
 
 @app.get("/api/health")
-def health() -> Dict[str, Any]:
-    return {"status": "online", "version": app.version, "cache_entries": len(_cache), "cache_ttl_seconds": CACHE_TTL_SECONDS}
+async def health() -> dict[str, Any]:
+    return {"status": "ok", "service": "planetary-digital-twin", "cache_items": len(_cache), "cache_ttl_seconds": CACHE_TTL_SECONDS}
 
 
 @app.get("/api/digital-twin")
-async def digital_twin(lat: float = Query(17.25), lng: float = Query(-88.7667)) -> JSONResponse:
-    lat, lng = clean_coord(lat, lng)
-    key = cache_key(lat, lng)
-    now = time.time()
-    if key in _cache and now - _cache[key][0] < CACHE_TTL_SECONDS:
-        payload = dict(_cache[key][1])
-        payload["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL_SECONDS}
-        return JSONResponse(payload)
+async def digital_twin(lat: float = Query(..., ge=-90, le=90), lng: float = Query(..., ge=-180, le=180)) -> JSONResponse:
+    lat, lng = clamp_coordinate(lat, lng)
+    key = f"digital-twin:{lat:.3f}:{lng:.3f}"
+    cached = cache_get(key)
+    if cached:
+        cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL_SECONDS}
+        return JSONResponse(cached)
 
-    async with httpx.AsyncClient(headers={"User-Agent": "planetary-digital-twin/1.1"}) as client:
-        weather = await fetch_weather(client, lat, lng)
-        air = await fetch_air_quality(client, lat, lng)
-        eonet = await fetch_eonet(client, lat, lng)
-        quakes = await fetch_quakes(client, lat, lng)
+    weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current=temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m&timezone=auto"
+    air_url = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lng}&current=pm2_5,carbon_monoxide,us_aqi,european_aqi&timezone=auto"
+    eonet_url = "https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=50"
+    usgs_url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson"
+
+    async with httpx.AsyncClient(headers={"User-Agent": "planetary-digital-twin/1.0"}) as client:
+        weather_ok, weather_data, weather_error = await fetch_json(client, weather_url)
+        air_ok, air_data, air_error = await fetch_json(client, air_url)
+        eonet_ok, eonet_data, eonet_error = await fetch_json(client, eonet_url)
+        usgs_ok, usgs_data, usgs_error = await fetch_json(client, usgs_url)
+
+    weather_current = (weather_data or {}).get("current") or {}
+    air_current = (air_data or {}).get("current") or {}
+
+    temp = weather_current.get("temperature_2m")
+    humidity = weather_current.get("relative_humidity_2m")
+    precipitation = weather_current.get("precipitation")
+    wind = weather_current.get("wind_speed_10m")
+    pm25 = air_current.get("pm2_5")
+    us_aqi = air_current.get("us_aqi")
+    eu_aqi = air_current.get("european_aqi")
+    carbon_monoxide = air_current.get("carbon_monoxide")
+
+    eonet_features = []
+    for event in (eonet_data or {}).get("events", []):
+        if event.get("geometry"):
+            eonet_features.append({"title": event.get("title"), "geometry": event["geometry"][0], "properties": {"title": event.get("title")}})
+    nearest_event = nearest_from_geojson(lat, lng, eonet_features, "NASA EONET")
+    nearest_quake = nearest_from_geojson(lat, lng, (usgs_data or {}).get("features", []), "USGS")
+
+    risk = classify_risk(
+        pm25=pm25,
+        wind_kmh=wind,
+        precipitation_mm=precipitation,
+        event_km=nearest_event.distance_km if nearest_event else None,
+        quake_km=nearest_quake.distance_km if nearest_quake else None,
+    )
 
     payload = {
-        "coordinate": {"lat": lat, "lng": lng},
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "coordinate": {"latitude": lat, "longitude": lng},
+        "timestamp_utc": int(time.time()),
         "cache": {"hit": False, "ttl_seconds": CACHE_TTL_SECONDS},
         "api_status": {
-            "weather": weather.get("status"),
-            "air_quality": air.get("status"),
-            "nasa_eonet": eonet.get("status"),
-            "usgs_quakes": quakes.get("status"),
+            "weather": {"online": weather_ok, "error": weather_error},
+            "air_quality": {"online": air_ok, "error": air_error},
+            "nasa_eonet": {"online": eonet_ok, "error": eonet_error},
+            "usgs_earthquakes": {"online": usgs_ok, "error": usgs_error},
         },
-        "observations": {"weather": weather, "air_quality": air},
-        "hazards": {"nasa_eonet": eonet, "usgs_quakes": quakes},
-        "risk": classify_risk(weather, air, eonet, quakes),
+        "observations": {
+            "temperature_c": temp,
+            "relative_humidity_percent": humidity,
+            "precipitation_mm": precipitation,
+            "wind_speed_kmh": wind,
+            "pm25_ugm3": pm25,
+            "us_aqi": us_aqi,
+            "european_aqi": eu_aqi,
+            "carbon_monoxide_ugm3": carbon_monoxide,
+        },
+        "hazards": {
+            "nearest_nasa_event": nearest_event.__dict__ if nearest_event else None,
+            "nearest_usgs_earthquake": nearest_quake.__dict__ if nearest_quake else None,
+        },
+        "risk": risk,
         "notes": [
-            "Weather primary endpoint amended to current_weather=true with America/Belize timezone.",
-            "Richer Open-Meteo current= endpoint retained as fallback.",
-            "Air-quality current endpoint includes hourly fallback for browser/serverless reliability.",
+            "The globe overlays are visualization layers unless replaced with validated gridded geospatial datasets.",
+            "The API fusion panel uses live or near-real-time public feeds and is suitable as an operational prototype baseline.",
         ],
     }
-    _cache[key] = (now, payload)
+    cache_set(key, payload)
     return JSONResponse(payload)
