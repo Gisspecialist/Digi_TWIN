@@ -67,3 +67,24 @@ The frontend Vector Targeting panel has been corrected to use standard decimal-d
 - Belize approximate geographic center: latitude `17.25`, longitude `-88.7667`.
 
 The application now starts with Belize as the default vector target and includes quick presets for Belize Center and New York City.
+
+
+## Coordinate Alignment Patch
+
+The frontend now uses a true latitude/longitude-to-sphere-vector conversion instead of the earlier approximate Euler mapping. This keeps the base Earth texture, target marker, overlays, and vector targeting system aligned.
+
+Default Belize coordinate:
+
+```text
+Latitude: 17.25
+Longitude: -88.7667
+```
+
+Coordinate convention:
+
+- North latitude is positive.
+- South latitude is negative.
+- East longitude is positive.
+- West longitude is negative.
+
+The application now displays a yellow target marker and ring on the selected surface coordinate. The same computed 3D vector is used to rotate the globe into camera view, preventing visual mismatch between the base map and selected coordinate.

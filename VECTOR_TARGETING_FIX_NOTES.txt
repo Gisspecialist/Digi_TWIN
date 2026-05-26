@@ -21,3 +21,22 @@ Frontend changes:
 - Belize Center preset button added.
 - New York preset retained for comparison/testing.
 - Initial backend data-fusion call now starts at Belize coordinates.
+
+2026-05-25 Coordinate System Alignment Patch
+--------------------------------------------
+This patch aligns the 3D base map and vector targeting logic by replacing the earlier approximate Euler rotation method with a true lat/lng-to-sphere-vector method.
+
+Key changes:
+- Belize remains the default coordinate: latitude 17.25, longitude -88.7667.
+- A yellow surface marker and ring now show the exact selected coordinate on the globe.
+- latLngToVector3(lat, lng, radius) converts decimal degrees to the same sphere coordinate system used by the Three.js Earth texture.
+- rotationEulerForLatLng(lat, lng) rotates the exact selected surface vector toward the camera, keeping the base map, marker, overlays, and targeting system aligned.
+- Reset now restores x, y, and z rotation to 0, not only x.
+- Frontend self-tests now check sphere radius preservation and north/south pole orientation.
+
+Coordinate convention:
+- North latitude = positive.
+- South latitude = negative.
+- East longitude = positive.
+- West longitude = negative.
+- Belize geographic center example: 17.25, -88.7667.
